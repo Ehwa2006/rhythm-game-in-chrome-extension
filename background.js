@@ -1,53 +1,53 @@
 // ====== Background Service Worker ======
 
 chrome.runtime.onMessage.addListener((request, sender, sendResponse) => {
-
-  // ====== START_GAME: 팝업에서 요청 ======
+  console.log("[BG] ✅ Message received:", request.type, "from tab:", sender?.tab?.id);
+  
   if (request.type === "START_GAME") {
     const tabId = request.tabId;
-    if (!tabId) { sendResponse({ success: false, error: "no_tab_id" }); return; }
+    console.log("[BG] START_GAME - tabId:", tabId);
+    
+    if (!tabId) {
+      console.error("[BG] ❌ No tabId!");
+      sendResponse({ success: false, error: "no_tab_id" });
+      return;
+    }
 
-    // 1) overlay.js 주입 (MAIN world - 렌더링 담당)
+    // 1) content.js 먼저 로드 (isolated world)
+    console.log("[BG] Injecting content.js...");
     chrome.scripting.executeScript(
-      { target: { tabId }, files: ["overlay.js"], world: "MAIN" },
+      { target: { tabId }, files: ["content.js"], world: "ISOLATED" },
       () => {
-        if (chrome.runtime.lastError) {
-          sendResponse({ success: false, error: chrome.runtime.lastError.message });
-          return;
-        }
-        // 2) tabCapture streamId 발급 후 content.js로 전달
-        chrome.tabCapture.getMediaStreamId({ targetTabId: tabId }, (streamId) => {
-          const sid = (!chrome.runtime.lastError && streamId) ? streamId : null;
-          if (!sid) console.warn("[BG] tabCapture failed:", chrome.runtime.lastError?.message);
-
-          chrome.tabs.sendMessage(tabId,
-            { type: "START_AUDIO", streamId: sid },
-            () => { /* content.js가 처리 */ }
-          );
-          sendResponse({ success: true });
-        });
-      }
-    );
-    return true;
-  }
-
-  // ====== INJECT_OVERLAY: content.js에서 직접 요청할 때 ======
-  if (request.type === "INJECT_OVERLAY") {
-    const tabId = sender?.tab?.id;
-    if (!tabId) { sendResponse({ success: false, error: "no_tab_id" }); return; }
-
-    chrome.scripting.executeScript(
-      { target: { tabId }, files: ["overlay.js"], world: "MAIN" },
-      () => {
-        if (chrome.runtime.lastError) {
-          sendResponse({ success: false, error: chrome.runtime.lastError.message });
-          return;
-        }
-        chrome.tabCapture.getMediaStreamId({ targetTabId: tabId }, (streamId) => {
-          const sid = (!chrome.runtime.lastError && streamId) ? streamId : null;
-          chrome.tabs.sendMessage(tabId, { type: "START_AUDIO", streamId: sid }, () => {});
-          sendResponse({ success: true });
-        });
+        console.log("[BG] ✅ content.js injected");
+        
+        // 2) overlay.js 로드 (MAIN world)
+        console.log("[BG] Injecting overlay.js...");
+        chrome.scripting.executeScript(
+          { target: { tabId }, files: ["overlay.js"], world: "MAIN" },
+          () => {
+            console.log("[BG] ✅ overlay.js injected");
+            
+            if (chrome.runtime.lastError) {
+              console.error("[BG] ❌ Script injection failed:", chrome.runtime.lastError);
+              sendResponse({ success: false, error: chrome.runtime.lastError.message });
+              return;
+            }
+            
+            // 3) 약간의 지연 후 START_AUDIO 메시지 전송 (content.js가 준비될 시간 제공)
+            setTimeout(() => {
+              console.log("[BG] Sending START_AUDIO to content.js...");
+              chrome.tabs.sendMessage(tabId, { type: "START_AUDIO", streamId: null }, (response) => {
+                if (chrome.runtime.lastError) {
+                  console.warn("[BG] ⚠️ sendMessage error:", chrome.runtime.lastError.message);
+                } else {
+                  console.log("[BG] ✅ sendMessage success");
+                }
+              });
+            }, 100);  // 100ms 지연
+            
+            sendResponse({ success: true });
+          }
+        );
       }
     );
     return true;
@@ -56,18 +56,30 @@ chrome.runtime.onMessage.addListener((request, sender, sendResponse) => {
 
 // ====== 아이콘 클릭 ======
 chrome.action.onClicked.addListener((tab) => {
+  console.log("[BG] Icon clicked on tab:", tab.id);
+  
   chrome.tabs.sendMessage(tab.id, { type: "TOGGLE_GAME" }, (response) => {
     if (chrome.runtime.lastError) {
-      // content.js 없음 → 직접 실행
+      console.log("[BG] TOGGLE_GAME - content.js not ready, injecting scripts");
+      
+      // content.js 먼저 로드
       chrome.scripting.executeScript(
-        { target: { tabId: tab.id }, files: ["overlay.js"], world: "MAIN" },
+        { target: { tabId: tab.id }, files: ["content.js"], world: "ISOLATED" },
         () => {
-          chrome.tabCapture.getMediaStreamId({ targetTabId: tab.id }, (streamId) => {
-            const sid = (!chrome.runtime.lastError && streamId) ? streamId : null;
-            chrome.tabs.sendMessage(tab.id, { type: "START_AUDIO", streamId: sid }, () => {});
-          });
+          // overlay.js 로드
+          chrome.scripting.executeScript(
+            { target: { tabId: tab.id }, files: ["overlay.js"], world: "MAIN" },
+            () => {
+              console.log("[BG] Scripts injected, sending START_AUDIO");
+              setTimeout(() => {
+                chrome.tabs.sendMessage(tab.id, { type: "START_AUDIO", streamId: null }, () => {});
+              }, 100);
+            }
+          );
         }
       );
+    } else {
+      console.log("[BG] TOGGLE_GAME sent successfully");
     }
   });
 });

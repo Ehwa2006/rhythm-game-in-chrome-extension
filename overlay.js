@@ -15,8 +15,26 @@ if (window.__RHYTHM_GAME_LOADED__) {
   let keydownHandler = null;     // 이벤트 리스너 참조 저장 (제거용)
   let visibilityHandler = null;
 
+  // 오디오 캡처 변수
+  let audioCtx = null;
+  let analyser = null;
+  let dataArray = null;
+  let beatDetecting = false;
+  let lastBeatTime = 0;
+
+  // ── 비트 감지 파라미터 (고감도 모드) ──
+  const BEAT_THRESHOLD = 75;
+  const BEAT_COOLDOWN = 0.15;
+  const BEAT_THRESHOLD_DECAY = 0.98;  // 임계값 감소 계수
+
   let notes = [];
   let effects = [];
+  let beatPattern = [];           // 자동 스폰 비트 패턴 (Spotify 모드용)
+  let beatPatternIndex = 0;
+  const AUTO_SPAWN_PATTERN = [    // 더 빈번한 비트 패턴 (8박 반복, 고감도 모드)
+    true, true, true, false,      // 1박, 2박, 3박, 4박 skip
+    true, false, true, true       // 5박, 6박 skip, 7박, 8박
+  ];
 
   const gameState = {
     score: 0,
@@ -40,7 +58,7 @@ if (window.__RHYTHM_GAME_LOADED__) {
   const NOTE_SPEED = 5;          // px/frame
   const HIT_PERFECT = 24;        // px 범위
   const HIT_GOOD = 50;
-  const AUTO_SPAWN_INTERVAL = 38; // 오디오 없을 때 자동 스폰 (프레임 단위)
+  const AUTO_SPAWN_INTERVAL = 30; // 오디오 없을 때 자동 스폰 (프레임 단위, 고감도 모드)
 
   // 레인 X 위치 계산
   function getLaneX(laneIndex) {
@@ -118,7 +136,7 @@ if (window.__RHYTHM_GAME_LOADED__) {
     const statusDiv = document.createElement("div");
     statusDiv.id = "rg-status";
     statusDiv.style.cssText = "font-size:11px;opacity:0.7;margin-top:4px;";
-    statusDiv.textContent = "🎵 소리 감지 중...";
+    statusDiv.textContent = "⏸️ 대기 중 (음악 없음)";
     uiContainer.appendChild(statusDiv);
     container.appendChild(uiContainer);
 
@@ -402,12 +420,19 @@ if (window.__RHYTHM_GAME_LOADED__) {
       }
     }
 
-    // 오디오 없을 때 자동 스폰
+    // 자동 스폰: 음악 감지 실패 시 자동 비트 패턴
     if (!gameState.audioReady) {
       autoSpawnTimer++;
       if (autoSpawnTimer >= AUTO_SPAWN_INTERVAL) {
-        spawnNote();
         autoSpawnTimer = 0;
+        
+        // 비트 패턴에 따라 노트 생성
+        if (AUTO_SPAWN_PATTERN[beatPatternIndex]) {
+          const lane = beatPatternIndex % 4;
+          notes.push({ lane, y: -NOTE_H });
+        }
+        
+        beatPatternIndex = (beatPatternIndex + 1) % AUTO_SPAWN_PATTERN.length;
       }
     }
 
@@ -507,6 +532,143 @@ if (window.__RHYTHM_GAME_LOADED__) {
     };
   }
 
+  // ===== 오디오 캡처 및 비트 감지 =====
+  function startAudioCapture(streamId) {
+    console.log("[Overlay] startAudioCapture called with streamId:", streamId);
+    
+    if (!streamId) {
+      console.log("[Overlay] ⚠️ streamId is null/undefined - trying microphone instead...");
+      tryMicrophone();
+      return;
+    }
+
+    console.log("[Overlay] Attempting tabCapture (timeout: 3s)...");
+    
+    // 3초 타임아웃
+    const timeoutPromise = new Promise((_, reject) => {
+      setTimeout(() => reject(new Error("timeout")), 3000);
+    });
+
+    Promise.race([
+      navigator.mediaDevices.getUserMedia({
+        audio: {
+          mandatory: {
+            chromeMediaSource: "tab",
+            chromeMediaSourceId: streamId
+          }
+        },
+        video: false
+      }),
+      timeoutPromise
+    ]).then((stream) => {
+      console.log("[Overlay] ✅ tabCapture success!");
+      connectAudioStream(stream);
+
+    }).catch((err) => {
+      console.log("[Overlay] tabCapture failed - trying microphone...");
+      tryMicrophone();
+    });
+  }
+
+  // ===== 마이크로 오디오 캡처 =====
+  function tryMicrophone() {
+    console.log("[Overlay] Attempting microphone capture...");
+    
+    setStatus("🎤 마이크 설정 중... (스테레오 믹스 필요)");
+
+    navigator.mediaDevices.getUserMedia({
+      audio: {
+        echoCancellation: false,
+        noiseSuppression: false,
+        autoGainControl: false
+      },
+      video: false
+    }).then((stream) => {
+      console.log("[Overlay] ✅ Microphone success!");
+      setStatus("🎤 마이크 음성 감지 중...");
+      connectAudioStream(stream);
+
+    }).catch((err) => {
+      console.log("[Overlay] Microphone failed:", err.message);
+      console.log("[Overlay] Falling back to auto beat mode");
+      setStatus("🎮 자동 타이밍 모드");
+      enableAutoSpawn();
+    });
+  }
+
+  // ===== 오디오 스트림 연결 =====
+  function connectAudioStream(stream) {
+    audioCtx = new AudioContext();
+    analyser = audioCtx.createAnalyser();
+    analyser.fftSize = 512;
+    analyser.smoothingTimeConstant = 0.55;
+    dataArray = new Uint8Array(analyser.frequencyBinCount);
+
+    const src = audioCtx.createMediaStreamSource(stream);
+    src.connect(analyser);
+
+    console.log("[Overlay] Audio analysis STARTED");
+
+    beatDetecting = true;
+    gameState.audioReady = false;
+    detectBeat();
+  }
+
+  // ===== 자동 비트 모드 활성화 =====
+  function enableAutoSpawn() {
+    gameState.audioReady = false;
+  }
+
+  function detectBeat() {
+    if (!beatDetecting || !analyser) {
+      return;
+    }
+
+    analyser.getByteFrequencyData(dataArray);
+
+    // 저음역 분석
+    let bass = 0;
+    const bassEnd = Math.min(8, dataArray.length);
+    for (let i = 0; i < bassEnd; i++) bass += dataArray[i];
+    bass /= bassEnd;
+
+    let lowMid = 0;
+    const lowMidStart = Math.floor(dataArray.length * 0.05);
+    const lowMidEnd = Math.floor(dataArray.length * 0.15);
+    for (let i = lowMidStart; i < lowMidEnd; i++) lowMid += dataArray[i];
+    lowMid /= (lowMidEnd - lowMidStart);
+
+    let mid = 0;
+    const midStart = Math.floor(dataArray.length * 0.15);
+    const midEnd = Math.floor(dataArray.length * 0.4);
+    for (let i = midStart; i < midEnd; i++) mid += dataArray[i];
+    mid /= (midEnd - midStart);
+
+    let high = 0;
+    const highStart = Math.floor(dataArray.length * 0.4);
+    const highEnd = Math.floor(dataArray.length * 0.7);
+    for (let i = highStart; i < highEnd; i++) high += dataArray[i];
+    high /= (highEnd - highStart);
+
+    const combined = bass * 0.7 + lowMid * 0.2 + mid * 0.08 + high * 0.02;
+    const now = audioCtx.currentTime;
+
+    // 매초마다 에너지 값 출력
+    if (Math.floor(now) !== Math.floor(lastBeatTime)) {
+      console.log(`[Audio] energy:${combined.toFixed(1)} bass:${bass.toFixed(0)} threshold:${BEAT_THRESHOLD}`);
+    }
+
+    // 비트 감지
+    if (combined > BEAT_THRESHOLD && now - lastBeatTime > BEAT_COOLDOWN) {
+      lastBeatTime = now;
+      console.log(`[BEAT!] energy:${combined.toFixed(1)} - spawning note`);
+      spawnNote();
+      gameState.audioReady = true;
+    }
+
+    requestAnimationFrame(detectBeat);
+  }
+
     // ===== 게임 초기화 =====
   function initGame() {
     console.log("Rhythm Game: initGame() starting...");
@@ -532,15 +694,24 @@ if (window.__RHYTHM_GAME_LOADED__) {
 
 // content.js(isolated world)에서 오는 이벤트 수신
 window.addEventListener("message", (event) => {
-  if (!event.data) return;
-  if (event.data.type === "RHYTHM_TOGGLE" && window.toggleGame) {
+  // 올바른 데이터 구조만 처리
+  if (!event.data || typeof event.data !== "object") return;
+  if (!event.data.type) return;
+  
+  const type = event.data.type;
+  
+  if (type === "RHYTHM_TOGGLE" && window.toggleGame) {
     window.toggleGame();
   }
-  if (event.data.type === "RHYTHM_BEAT") {
-    // 비트 감지 → 노트 스폰 (overlay 내부 함수 직접 호출)
+  if (type === "RHYTHM_BEAT") {
+    gameState.audioReady = true;
     if (window.__rhythmSpawnNote__) window.__rhythmSpawnNote__();
   }
-  if (event.data.type === "RHYTHM_STATUS") {
+  if (type === "RHYTHM_STATUS") {
     if (window.__rhythmSetStatus__) window.__rhythmSetStatus__(event.data.msg);
+  }
+  if (type === "RHYTHM_STREAM_ID") {
+    console.log("[Overlay] RHYTHM_STREAM_ID received, streamId:", event.data.streamId);
+    startAudioCapture(event.data.streamId);
   }
 });

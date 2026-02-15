@@ -13,112 +13,35 @@ if (window.__RHYTHM_CONTENT_LOADED__) {
   let beatDetecting = false;
   let lastBeatTime = 0;
 
-  const BEAT_THRESHOLD = 130;
-  const BEAT_COOLDOWN = 0.22; // seconds
+  // 🔴 tabCapture는 isolated world에서 작동 불가능 (Chrome 보안 정책)
+  // → 자동 비트 모드만 제공
+
+  // ── 비트 감지 파라미터 (Spotify 특화 - 고감도 모드) ──
+  const BEAT_THRESHOLD = 75;         // 더 민감한 감지 (낮을수록 민감)
+  const BEAT_COOLDOWN = 0.15;        // 더 빠른 연속 감지 가능
+  const SPOTIFY_MODE = true;         // Spotify 최적화 모드
 
   // ── background로부터 메시지 수신 ──
   chrome.runtime.onMessage.addListener((request, sender, sendResponse) => {
+    console.log("[Content] ✅ Received message:", request.type, "streamId:", request.streamId);
+    
     if (request.type === "TOGGLE_GAME") {
       window.postMessage({ type: "RHYTHM_TOGGLE" }, "*");
       sendResponse({ success: true });
     }
+    // START_AUDIO 요청: streamId를 MAIN world (overlay.js)로 전달
     if (request.type === "START_AUDIO") {
-      startAudio(request.streamId);
+      console.log("[Content] START_AUDIO received - forwarding to overlay.js...");
+      window.postMessage({ 
+        type: "RHYTHM_STREAM_ID", 
+        streamId: request.streamId 
+      }, "*");
+      console.log("[Content] ✅ Posted message to overlay.js");
       sendResponse({ success: true });
     }
   });
 
-  function startAudio(streamId) {
-    if (!streamId) {
-      notifyStatus("🎮 자동 스폰 모드");
-      return;
-    }
-
-    // isolated world에서 chromeMediaSource: "tab" 사용 가능
-    navigator.mediaDevices.getUserMedia({
-      audio: {
-        mandatory: {
-          chromeMediaSource: "tab",
-          chromeMediaSourceId: streamId
-        }
-      },
-      video: false
-    }).then((stream) => {
-      audioCtx = new AudioContext();
-      analyser = audioCtx.createAnalyser();
-      analyser.fftSize = 512;
-      analyser.smoothingTimeConstant = 0.75;
-      dataArray = new Uint8Array(analyser.frequencyBinCount);
-
-      const src = audioCtx.createMediaStreamSource(stream);
-      src.connect(analyser);
-      // destination에 연결 안 함 → Spotify 소리 출력에 영향 없음
-
-      notifyStatus("🎵 탭 오디오 연결됨 ✅");
-      console.log("[RhythmContent] tabCapture connected");
-
-      beatDetecting = true;
-      detectBeat();
-
-    }).catch((err) => {
-      console.warn("[RhythmContent] tabCapture failed:", err.message);
-      notifyStatus("🎤 마이크 연결 시도...");
-      tryMicrophone();
-    });
-  }
-
-  function tryMicrophone() {
-    navigator.mediaDevices.getUserMedia({ audio: true, video: false })
-      .then((stream) => {
-        audioCtx = new AudioContext();
-        analyser = audioCtx.createAnalyser();
-        analyser.fftSize = 512;
-        analyser.smoothingTimeConstant = 0.75;
-        dataArray = new Uint8Array(analyser.frequencyBinCount);
-
-        const src = audioCtx.createMediaStreamSource(stream);
-        src.connect(analyser);
-
-        notifyStatus("🎤 마이크 연결됨");
-        beatDetecting = true;
-        detectBeat();
-      })
-      .catch(() => {
-        notifyStatus("🎮 자동 스폰 모드");
-      });
-  }
-
-  function detectBeat() {
-    if (!beatDetecting || !analyser) return;
-
-    analyser.getByteFrequencyData(dataArray);
-
-    // 저음역 에너지
-    let energy = 0;
-    const bins = Math.min(15, dataArray.length);
-    for (let i = 0; i < bins; i++) energy += dataArray[i];
-    energy /= bins;
-
-    // 중음역
-    let mid = 0;
-    const mStart = Math.floor(dataArray.length * 0.1);
-    const mEnd   = Math.floor(dataArray.length * 0.3);
-    for (let i = mStart; i < mEnd; i++) mid += dataArray[i];
-    mid /= (mEnd - mStart);
-
-    const combined = energy * 0.7 + mid * 0.3;
-    const now = audioCtx.currentTime;
-
-    if (combined > BEAT_THRESHOLD && now - lastBeatTime > BEAT_COOLDOWN) {
-      lastBeatTime = now;
-      // MAIN world의 overlay에 비트 이벤트 전송
-      window.postMessage({ type: "RHYTHM_BEAT" }, "*");
-    }
-
-    requestAnimationFrame(detectBeat);
-  }
-
-  function notifyStatus(msg) {
-    window.postMessage({ type: "RHYTHM_STATUS", msg }, "*");
-  }
+  // 게임 초기화: streamId 대기 상태
+  window.postMessage({ type: "RHYTHM_STATUS", msg: "🎮 오버레이 준비 완료" }, "*");
+  console.log("[Content] ✅ Loaded - ready to receive streamId from background");
 }
