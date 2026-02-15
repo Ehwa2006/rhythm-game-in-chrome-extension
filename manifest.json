@@ -1,0 +1,27 @@
+{
+  "manifest_version": 3,
+  "name": "Rhythm Overlay Game",
+  "version": "1.3",
+  "description": "A rhythm game overlay for web pages (YouTube, Spotify, etc.)",
+  "permissions": ["scripting", "activeTab", "tabCapture"],
+  "host_permissions": ["<all_urls>"],
+  "background": {
+    "service_worker": "background.js"
+  },
+  "action": {
+    "default_popup": "popup.html"
+  },
+  "content_scripts": [
+    {
+      "matches": ["<all_urls>"],
+      "js": ["content.js"],
+      "run_at": "document_start"
+    }
+  ],
+  "web_accessible_resources": [
+    {
+      "resources": ["overlay.js"],
+      "matches": ["<all_urls>"]
+    }
+  ]
+}
